@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.py[cod]
+*.pth
+*.safetensors
+tmp/
+output/
+*.DS_Store
+weights/
+.venv/
+models/          # SeedVR2 / RIFE weights (downloaded on first use)
+third_party/*    # vendored SeedVR2 pipeline (fetched by setup.sh)
+!third_party/rife/   # RIFE IFNet is tiny and locally patched (fp16 warp) → keep in git
+!third_party/codeformer/   # CodeFormer arch files, basicsr imports stripped → keep in git
+third_party/*/__pycache__/
+*.pkl
+.gradio/

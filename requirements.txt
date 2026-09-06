@@ -1,0 +1,43 @@
+# PyTorch with CUDA 12.x for NVIDIA H100 (Hopper, sm_90)
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch>=2.4
+torchaudio
+torchcodec          # required by torchaudio>=2.5 as default audio loader
+
+# Video upscaling — Real-ESRGAN
+spandrel            # Real-ESRGAN loader (no build-time torch dep)
+
+# Video upscaling — SeedVR2 (code vendored in third_party/seedvr2 by setup.sh)
+# Only the runtime deps SeedVR2 actually imports; `peft`/`gguf` from its own
+# requirements.txt are unused here (we load fp16 safetensors, not GGUF).
+einops
+omegaconf>=2.3.0
+diffusers>=0.33.1,<0.36   # >=0.36 pulls huggingface_hub 1.x, breaking transformers 4.30 (audiosr)
+rotary_embedding_torch>=0.5.3
+safetensors
+psutil
+
+# Face restoration — CodeFormer (arch vendored in third_party/codeformer) + GFPGAN (via spandrel)
+# facexlib provides RetinaFace detection / alignment / ParseNet masks. Installed with
+# --no-deps in setup.sh: its metadata would otherwise pull numpy 2.x. Runtime deps
+# (torchvision, scipy, numba, opencv, Pillow) are already present; filterpy added below.
+# NOTE: do NOT install `basicsr` or `gfpgan` from PyPI — both break on modern torchvision.
+filterpy
+
+# Audio upscaling
+audiosr
+matplotlib          # undeclared dep of audiosr.utilities
+scipy               # undeclared dep of audiosr / librosa DSP
+
+# Media I/O
+ffmpeg-python
+opencv-python-headless
+librosa
+soundfile
+
+# App / infra
+gradio==6.14.0
+numpy<2.0           # audiosr, scipy, librosa not yet numpy-2.x compatible
+setuptools<81       # librosa 0.9.x (pinned by audiosr) needs pkg_resources
+huggingface_hub<1.0 # transformers 4.30.2 (audiosr) requires <1.0
+python-dotenv
