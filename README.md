@@ -145,3 +145,13 @@ interpolates sharp frames, and keeps the clip duration unchanged.
 one local patch: the warp grid cache is keyed on dtype so fp16 works. The
 `flownet.pkl` weights are the author's official release, fetched from
 [`hzwer/RIFE`](https://huggingface.co/hzwer/RIFE) on Hugging Face.
+
+## Batch processing
+
+`batch-videos.py` applies Upscale / Frame Rate / Face Restoration to many videos in one run
+(outputs `<name>_slp.mp4` in `output/batch/`, "Download All" as TAR). See
+[BATCH_PROCESSING.md](BATCH_PROCESSING.md).
+
+```bash
+GRADIO_SERVER_PORT=7862 python batch-videos.py
+```
