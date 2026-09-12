@@ -8,17 +8,37 @@ Pipeline: `upscale (Real-ESRGAN | SeedVR2) → restore faces (CodeFormer | GFPGA
 
 **Limits:** max 2 minutes, max 300 MB.
 
-## Setup (Azure VM · Ubuntu · H100)
+## Setup (clean Ubuntu · NVIDIA GPU)
 
 ```bash
 ./setup.sh
 ```
 
-This installs `ffmpeg`, creates a Python 3.11 virtual environment in `.venv`,
-installs all dependencies (PyTorch with CUDA 12.x for Hopper/sm_90), and vendors
-the SeedVR2 pipeline into `third_party/seedvr2`. SeedVR2 weights (~6.5 GB),
-RIFE weights (~25 MB) and face-restoration weights (~900 MB) are downloaded to
-`models/` on first use.
+The idempotent installer supports Ubuntu 22.04/24.04. It installs Python 3.11,
+build/media libraries (`ffmpeg`, libsndfile, OpenGL/GLib, espeak-ng), creates
+`.venv`, installs the pinned Python stack (including CUDA PyTorch), checks out
+the pinned SeedVR2 source, creates runtime directories, and performs import and
+CUDA smoke tests. It requires `sudo` (or must run as root) and Internet access.
+
+The NVIDIA driver should normally come from the GPU VM image. On a clean bare
+Ubuntu host with an NVIDIA GPU, the script can install Ubuntu's recommended
+driver; reboot afterward and rerun setup for the CUDA verification:
+
+```bash
+INSTALL_NVIDIA_DRIVER=1 ./setup.sh
+sudo reboot
+./setup.sh
+```
+
+To discard and recreate an existing virtual environment:
+
+```bash
+RECREATE_VENV=1 ./setup.sh
+```
+
+SeedVR2 weights (~6.5 GB), RIFE weights (~25 MB), Real-ESRGAN weights (~70 MB)
+and face-restoration weights (~900 MB) are downloaded to `models/` on first
+use. Reserve at least 10 GB for model downloads in addition to the environment.
 
 ## Run
 
