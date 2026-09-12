@@ -74,3 +74,20 @@ Stop  → stop_event.set() ──────────▶   progress_cb → _
 `log`, `output`, `elapsed`), the run flag, the stop event and the last TAR path. Because
 GPU models are loaded once per process and kept resident (see `README.md`), the batch
 avoids reload cost between videos. Only one batch may run at a time.
+
+## Runtime and troubleshooting
+
+* UI-only events (`Start/Stop`, the status timer, and `Download All`) use
+  `queue=False`. They do not enter Gradio's prediction queue, so timer polling cannot
+  accumulate behind processing requests.
+* The timer polls every 2 seconds. Completed video paths are returned only when the
+  output list changes; this avoids repeatedly hashing/copying large files into Gradio's
+  serving cache.
+* Stop is non-blocking. The HTTP callback sets the cancellation event immediately and
+  returns; FFmpeg readers/writers are terminated if cancellation interrupts a stage.
+* CUDA allocator caches stay warm between successful videos and are released once at
+  batch completion. This reduces model/allocator churn without unloading cached models.
+* `StarletteDeprecationWarning: HTTP_422_UNPROCESSABLE_ENTITY` originates in Gradio
+  6.14's queue route and does **not** indicate a failed video. The app bypasses that route
+  for polling and filters this known warning. Restart `batch-videos.py` after updates so
+  these changes take effect.

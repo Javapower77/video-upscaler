@@ -180,6 +180,7 @@ def restore_faces_video(
     prev_faces: list[tuple[np.ndarray, np.ndarray]] = []
 
     n = n_with_faces = n_faces = 0
+    completed = False
     try:
         while True:
             raw = reader.stdout.read(frame_bytes)
@@ -220,9 +221,15 @@ def restore_faces_video(
             writer.stdin.write(np.ascontiguousarray(frame[:, :, :3]).tobytes())
             if progress_cb:
                 progress_cb(min(n / total, 1.0))
+        completed = True
     finally:
-        reader.stdout.close(); reader.wait()
-        writer.stdin.close(); writer.wait()
+        reader.stdout.close()
+        writer.stdin.close()
+        if not completed:
+            reader.terminate()
+            writer.terminate()
+        reader.wait()
+        writer.wait()
         helper.clean_all()
         if DEVICE.type == "cuda":
             torch.cuda.empty_cache()

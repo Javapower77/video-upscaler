@@ -139,16 +139,24 @@ def upscale_video(
     total = max(1, int(info["duration"] * fps))
     done = 0
 
-    while True:
-        raw = reader.stdout.read(frame_bytes)
-        if not raw:
-            break
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
-        out_frame = _enhance_frame(module, model_scale, frame, scale)
-        writer.stdin.write(out_frame.tobytes())
-        done += 1
-        if progress_cb:
-            progress_cb(done / total)
-
-    reader.stdout.close();  reader.wait()
-    writer.stdin.close();   writer.wait()
+    completed = False
+    try:
+        while True:
+            raw = reader.stdout.read(frame_bytes)
+            if not raw:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
+            out_frame = _enhance_frame(module, model_scale, frame, scale)
+            writer.stdin.write(out_frame.tobytes())
+            done += 1
+            if progress_cb:
+                progress_cb(done / total)
+        completed = True
+    finally:
+        reader.stdout.close()
+        writer.stdin.close()
+        if not completed:
+            reader.terminate()
+            writer.terminate()
+        reader.wait()
+        writer.wait()

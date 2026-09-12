@@ -11,9 +11,21 @@ import tempfile
 import threading
 import time
 import traceback
+import warnings
 from dataclasses import dataclass, field
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Gradio 6.14 uses Starlette's old HTTP 422 alias in its queue endpoint.  It is
+# harmless, but a queued Timer request used to emit this warning every second.
+# UI-only callbacks below bypass the Gradio queue; keep this filter as a guard
+# for uploads and third-party clients that still call /queue/join.
+warnings.filterwarnings(
+    "ignore",
+    message=".*HTTP_422_UNPROCESSABLE_ENTITY.*deprecated.*",
+    category=DeprecationWarning,
+    module=r"gradio\.routes",
+)
 
 import gradio as gr
 import torch
@@ -59,12 +71,14 @@ class BatchState:
         self.thread: threading.Thread | None = None
         self.settings: dict = {}
         self.tar_path: str | None = None
+        self.published_outputs = 0
 
     def reset(self, files, settings):
         self.jobs = [Job(src=f, name=os.path.basename(f)) for f in files]
         self.settings = settings
         self.stop_event.clear()
         self.tar_path = None
+        self.published_outputs = 0
 
     def finished_all(self) -> bool:
         return bool(self.jobs) and not self.running and all(j.status == "done" for j in self.jobs)
@@ -205,9 +219,9 @@ def _process_one(job: Job, s: dict):
         _set(job, status="error", stage=f"Error: {e}", elapsed=time.time() - t0)
         _log(job, f"ERROR: {e}")
         traceback.print_exc()
+        _free_gpu()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        _free_gpu()
 
 
 def _worker():
@@ -224,6 +238,9 @@ def _worker():
     finally:
         with STATE.lock:
             STATE.running = False
+        # Keep CUDA allocator caches warm between videos, then release them once
+        # when the whole batch ends. This avoids allocator churn on every job.
+        _free_gpu()
 
 
 # ---------------------------------------------------------------------------
@@ -252,13 +269,20 @@ def _outputs() -> list[str]:
         return [j.output for j in STATE.jobs if j.output]
 
 
-def _ui_snapshot():
+def _ui_snapshot(force_outputs: bool = False):
     """Common return for start/stop/tick: status md, files, start-btn, download-btn, timer."""
     running = STATE.running
     finished = STATE.finished_all()
+    outputs = _outputs()
+    # Returning completed files on every Timer tick makes Gradio repeatedly
+    # hash/copy large videos into its cache. Publish only when the list changes.
+    with STATE.lock:
+        publish = force_outputs or len(outputs) != STATE.published_outputs
+        if publish:
+            STATE.published_outputs = len(outputs)
     return (
         _render_status(),
-        _outputs(),
+        outputs if publish else gr.skip(),
         gr.update(value="Stop Process" if running else "Start Process",
                   variant="stop" if running else "primary"),
         gr.update(interactive=finished),
@@ -269,8 +293,12 @@ def _ui_snapshot():
 def on_start_stop(files, ops, video_model, scale, face_choice, fidelity, fps_choice):
     if STATE.running:                          # acting as "Stop Process"
         STATE.stop_event.set()
-        if STATE.thread:
-            STATE.thread.join(timeout=120)
+        # Never join here: that blocked the HTTP response (and UI) for up to two
+        # minutes. The frame-level progress callback stops the worker shortly.
+        with STATE.lock:
+            for job in STATE.jobs:
+                if job.status == "running":
+                    job.stage = "Stopping after current frame…"
         return _ui_snapshot()
 
     if not files:
@@ -292,7 +320,7 @@ def on_start_stop(files, ops, video_model, scale, face_choice, fidelity, fps_cho
     STATE.running = True
     STATE.thread = threading.Thread(target=_worker, daemon=True)
     STATE.thread.start()
-    return _ui_snapshot()
+    return _ui_snapshot(force_outputs=True)
 
 
 def on_tick():
@@ -349,13 +377,15 @@ with gr.Blocks(title="Video Batch Processing") as demo:
     gr.Markdown("### 4. Processed videos (click to download)")
     files_out = gr.File(label="Outputs", file_count="multiple", interactive=False)
 
-    timer = gr.Timer(1.0, active=False)
+    # Two seconds is responsive enough while halving HTTP/rendering overhead.
+    timer = gr.Timer(2.0, active=False)
     outs = [status_md, files_out, start_btn, dl_btn, timer]
     start_btn.click(on_start_stop,
                     inputs=[files_in, ops, video_model, scale, face_choice, fidelity, fps_choice],
-                    outputs=outs)
-    timer.tick(on_tick, outputs=outs)
-    dl_btn.click(on_download_all, outputs=dl_btn)
+                    outputs=outs, queue=False, show_progress="hidden")
+    timer.tick(on_tick, outputs=outs, queue=False, show_progress="hidden",
+               trigger_mode="always_last")
+    dl_btn.click(on_download_all, outputs=dl_btn, queue=False, show_progress="hidden")
 
 if __name__ == "__main__":
     demo.launch(

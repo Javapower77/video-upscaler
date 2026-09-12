@@ -188,6 +188,7 @@ def interpolate_video(
     total_in = int(vs.get("nb_frames", 0) or 0) or max(1, int(float(probe["format"]["duration"]) * src_fps))
     frames_in = frames_out = 0
     timesteps = [(i + 1) / multi for i in range(multi - 1)]
+    completed = False
 
     raw = reader.stdout.read(frame_bytes)
     if not raw:
@@ -221,9 +222,15 @@ def interpolate_video(
         write(prev); frames_out += 1
         for _ in timesteps:
             write(prev); frames_out += 1
+        completed = True
     finally:
-        reader.stdout.close(); reader.wait()
-        writer.stdin.close(); writer.wait()
+        reader.stdout.close()
+        writer.stdin.close()
+        if not completed:
+            reader.terminate()
+            writer.terminate()
+        reader.wait()
+        writer.wait()
         if DEVICE.type == "cuda":
             torch.cuda.empty_cache()
 
