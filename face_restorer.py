@@ -10,17 +10,27 @@ Per frame:
   3. Paste back using a ParseNet soft mask so only skin/hair/eyes/etc. change;
      background and non-face pixels are untouched.
 
-Temporal stability: both models are per-image, so we reduce flicker by
-(a) keeping detection stable via a small ``eye_dist_threshold`` (ignore tiny /
-spurious faces), (b) blending each restored face crop with its restored
-predecessor when the face barely moved (EMA on the aligned crop), and
-(c) leaving frames without detected faces completely untouched.
+Temporal stability (both models are per-image):
+  (a) skip tiny / spurious faces via ``eye_dist_threshold``;
+  (b) greedy identity tracking + EMA of 5-point landmarks *before* warp, so the
+      affine does not swim;
+  (c) motion-adaptive EMA of restored 512 crops (always on, weight decays with
+      landmark motion — not a hard 6 px cutoff);
+  (d) mix a fraction of the original aligned crop back in (GFPGAN has no
+      fidelity slider; CodeFormer already has ``w``);
+  (e) hold the last restored face for a few missed detections instead of
+      snapping back to the unrestored frame.
 """
+from __future__ import annotations
+
+import math
 import os
 import sys
+from dataclasses import dataclass
+
 import cv2
-import numpy as np
 import ffmpeg
+import numpy as np
 import torch
 from torchvision.transforms.functional import normalize
 
@@ -47,13 +57,33 @@ WEIGHTS = {
 FACE_SIZE = 512
 # Skip faces whose inter-ocular distance is below this (px in the source frame).
 # Tiny faces restore badly and pop in/out between frames.
-MIN_EYE_DIST = 5
-# Temporal EMA on aligned crops: weight of the *previous* restored crop when the
-# face has barely moved. 0 disables. Keeps skin texture from shimmering.
-TEMPORAL_EMA = float(os.environ.get("FACE_TEMPORAL_EMA", "0.35"))
-# A face is considered "the same, barely moved" if its aligned landmarks moved
-# less than this many pixels (in the 512 template space).
-EMA_MAX_SHIFT = 6.0
+MIN_EYE_DIST = float(os.environ.get("FACE_MIN_EYE_DIST", "8"))
+# Temporal EMA on aligned crops: *maximum* weight of the previous restored crop
+# when the face is still. Weight decays with motion; 0 disables crop EMA.
+TEMPORAL_EMA = float(os.environ.get("FACE_TEMPORAL_EMA", "0.50"))
+# Landmark EMA *before* affine warp. Higher = more stable crop, more lag.
+LANDMARK_EMA = float(os.environ.get("FACE_LANDMARK_EMA", "0.50"))
+# Characteristic motion (as a fraction of inter-ocular distance) at which crop
+# EMA falls to ~37% of TEMPORAL_EMA. Larger = keep blending through speech.
+EMA_MOTION_TAU = float(os.environ.get("FACE_EMA_MOTION_TAU", "0.40"))
+# Keep pasting the last restored face for this many consecutive missed detections.
+HOLD_FRAMES = int(os.environ.get("FACE_HOLD_FRAMES", "3"))
+# Mix original aligned crop back into the restored crop (GFPGAN has no ``w``).
+# CodeFormer already has a fidelity slider, so its default is lower.
+BLEND_ORIGINAL = os.environ.get("FACE_BLEND_ORIGINAL")  # None → model default
+# Match gate as a multiple of inter-ocular distance (mean landmark L2).
+MATCH_GATE = float(os.environ.get("FACE_MATCH_GATE", "1.6"))
+# Looser gate used only when a leftover 1-to-1 pair remains after the first pass.
+MATCH_GATE_LOOSE = float(os.environ.get("FACE_MATCH_GATE_LOOSE", "3.0"))
+
+
+@dataclass
+class _Track:
+    landmarks: np.ndarray   # (5, 2) smoothed, source-frame pixels
+    restored: np.ndarray    # 512×512 BGR uint8
+    affine: np.ndarray      # 2×3 warp from crop → aligned 512
+    missed: int = 0
+
 
 _models: dict = {}
 _helper = None
@@ -139,6 +169,92 @@ def _restore_crop(net, name: str, face_bgr: np.ndarray, fidelity: float) -> np.n
     return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 
+def _blend_u8(a: np.ndarray, b: np.ndarray, w_b: float) -> np.ndarray:
+    """``out = (1-w_b)*a + w_b*b``, both BGR uint8."""
+    w_b = float(np.clip(w_b, 0.0, 1.0))
+    if w_b <= 1e-4:
+        return a
+    if w_b >= 1.0 - 1e-4:
+        return b
+    return cv2.addWeighted(a, 1.0 - w_b, b, w_b, 0)
+
+
+def _eye_dist(lm: np.ndarray) -> float:
+    return float(np.linalg.norm(lm[0] - lm[1]))
+
+
+def _lm_cost(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b, axis=1).mean())
+
+
+def _match_tracks(detections: list[np.ndarray], tracks: list[_Track]) -> tuple[dict[int, int], set[int], set[int]]:
+    """Greedy unique matching by mean 5-point landmark L2, gated by eye distance.
+
+    Returns ``(det_idx → track_idx, unmatched_dets, unmatched_tracks)``.
+    """
+    n_d, n_t = len(detections), len(tracks)
+    if n_d == 0 or n_t == 0:
+        return {}, set(range(n_d)), set(range(n_t))
+
+    costs = np.empty((n_d, n_t), dtype=np.float64)
+    for i, lm in enumerate(detections):
+        for j, tr in enumerate(tracks):
+            costs[i, j] = _lm_cost(lm, tr.landmarks)
+
+    used_d: set[int] = set()
+    used_t: set[int] = set()
+    matches: dict[int, int] = {}
+
+    order = np.argsort(costs, axis=None)
+    for k in order:
+        i, j = divmod(int(k), n_t)
+        if i in used_d or j in used_t:
+            continue
+        eye = max(_eye_dist(detections[i]), _eye_dist(tracks[j].landmarks), 1.0)
+        if costs[i, j] <= MATCH_GATE * eye:
+            matches[i] = j
+            used_d.add(i)
+            used_t.add(j)
+
+    leftover_d = [i for i in range(n_d) if i not in used_d]
+    leftover_t = [j for j in range(n_t) if j not in used_t]
+    # Talking-head / camera cut: a single leftover pair is almost always the same face.
+    if len(leftover_d) == 1 and len(leftover_t) == 1:
+        i, j = leftover_d[0], leftover_t[0]
+        eye = max(_eye_dist(detections[i]), _eye_dist(tracks[j].landmarks), 1.0)
+        if costs[i, j] <= MATCH_GATE_LOOSE * eye:
+            matches[i] = j
+            used_d.add(i)
+            used_t.add(j)
+
+    return matches, set(range(n_d)) - used_d, set(range(n_t)) - used_t
+
+
+def _smooth_landmarks(detected: np.ndarray, previous: np.ndarray) -> np.ndarray:
+    if LANDMARK_EMA <= 0:
+        return detected.astype(np.float64, copy=True)
+    a = float(np.clip(LANDMARK_EMA, 0.0, 0.95))
+    return a * previous + (1.0 - a) * detected
+
+
+def _crop_ema_weight(detected: np.ndarray, previous: np.ndarray) -> float:
+    """Weight of the *previous* restored crop. Decays with landmark motion."""
+    if TEMPORAL_EMA <= 0:
+        return 0.0
+    eye = max(_eye_dist(detected), _eye_dist(previous), 1.0)
+    shift_norm = _lm_cost(detected, previous) / eye
+    tau = max(EMA_MOTION_TAU, 1e-3)
+    return float(TEMPORAL_EMA) * math.exp(-shift_norm / tau)
+
+
+def _original_blend_weight(model_name: str) -> float:
+    if BLEND_ORIGINAL is not None:
+        return float(np.clip(float(BLEND_ORIGINAL), 0.0, 1.0))
+    # GFPGAN has no fidelity mix; lock a bit of the source crop so pores/teeth
+    # don't shimmer independently every frame. CodeFormer already has ``w``.
+    return 0.22 if model_name == "gfpgan" else 0.08
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -156,6 +272,7 @@ def restore_faces_video(
     """
     net = _get_model(model_name)
     helper = _get_helper()
+    orig_w = _original_blend_weight(model_name)
 
     probe = ffmpeg.probe(input_path)
     vs = next(s for s in probe["streams"] if s["codec_type"] == "video")
@@ -176,8 +293,7 @@ def restore_faces_video(
         .run_async(pipe_stdin=True, quiet=True)
     )
 
-    # Temporal state: per-face (landmarks, restored crop) from the previous frame
-    prev_faces: list[tuple[np.ndarray, np.ndarray]] = []
+    tracks: list[_Track] = []
 
     n = n_with_faces = n_faces = 0
     completed = False
@@ -191,32 +307,59 @@ def restore_faces_video(
 
             helper.clean_all()
             helper.read_image(frame)
-            helper.get_face_landmarks_5(only_center_face=False, resize=640, eye_dist_threshold=MIN_EYE_DIST)
+            helper.get_face_landmarks_5(
+                only_center_face=False, resize=640, eye_dist_threshold=MIN_EYE_DIST)
 
-            if helper.all_landmarks_5:
+            detected = [np.asarray(lm, dtype=np.float64) for lm in helper.all_landmarks_5]
+            matches, _unmatched_d, unmatched_t = _match_tracks(detected, tracks)
+
+            # Smooth landmarks of matched faces *before* the affine warp so the
+            # 512 crop does not swim independently of the restorer.
+            if detected:
+                helper.all_landmarks_5 = [
+                    _smooth_landmarks(lm, tracks[matches[i]].landmarks) if i in matches else lm
+                    for i, lm in enumerate(detected)
+                ]
                 helper.align_warp_face()
-                cur_faces = []
-                for lm, crop in zip(helper.all_landmarks_5, helper.cropped_faces):
-                    restored = _restore_crop(net, model_name, crop, fidelity)
 
-                    # Temporal EMA with the closest previous face (if it barely moved)
-                    if TEMPORAL_EMA > 0 and prev_faces:
-                        dists = [np.abs(lm - plm).max() for plm, _ in prev_faces]
-                        j = int(np.argmin(dists))
-                        if dists[j] <= EMA_MAX_SHIFT:
-                            restored = cv2.addWeighted(
-                                restored, 1.0 - TEMPORAL_EMA, prev_faces[j][1], TEMPORAL_EMA, 0)
+            next_tracks: list[_Track] = []
 
-                    helper.add_restored_face(restored)
-                    cur_faces.append((lm.copy(), restored))
-                    n_faces += 1
+            for i, (lm_raw, crop) in enumerate(zip(detected, helper.cropped_faces)):
+                restored = _restore_crop(net, model_name, crop, fidelity)
+                if orig_w > 0:
+                    restored = _blend_u8(restored, crop, orig_w)
 
+                if i in matches:
+                    tr = tracks[matches[i]]
+                    w_prev = _crop_ema_weight(lm_raw, tr.landmarks)
+                    if w_prev > 0.02:
+                        restored = _blend_u8(restored, tr.restored, w_prev)
+
+                next_tracks.append(_Track(
+                    landmarks=np.asarray(helper.all_landmarks_5[i], dtype=np.float64),
+                    restored=restored,
+                    affine=helper.affine_matrices[i].copy(),
+                    missed=0,
+                ))
+                helper.add_restored_face(restored)
+                n_faces += 1
+
+            # Detection hysteresis: keep pasting a face that flickered off for a
+            # couple of frames instead of exposing the unrestored crop.
+            for j in unmatched_t:
+                tr = tracks[j]
+                tr.missed += 1
+                if tr.missed <= HOLD_FRAMES:
+                    helper.affine_matrices.append(tr.affine.copy())
+                    helper.add_restored_face(tr.restored)
+                    next_tracks.append(tr)
+
+            tracks = next_tracks
+
+            if helper.restored_faces:
                 helper.get_inverse_affine()
                 frame = helper.paste_faces_to_input_image(upsample_img=frame)
-                prev_faces = cur_faces
                 n_with_faces += 1
-            else:
-                prev_faces = []
 
             writer.stdin.write(np.ascontiguousarray(frame[:, :, :3]).tobytes())
             if progress_cb:
